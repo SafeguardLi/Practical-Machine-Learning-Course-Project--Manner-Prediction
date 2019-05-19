@@ -1,0 +1,213 @@
+---
+title: "Practical Machine Learning Course Project - Manner Prediction"
+author: "Wangzhi Ll"
+date: "2019/5/17"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+
+## Abstract
+Nowadays, wearable devices could easily collect data to tell how much of particular activity we did. But we rarely quantify how well we did. Therefore, with data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants who were asked to perform barbell lifts correctly and incorrectly in 5 different ways, our goal is **to predict the manner in which they did in the exercise.**
+
+In this project, we would
+
+- build a prediction model,
+
+- practice cross validation,
+
+- measure the expeceted out of sample errors,
+
+- and make a final choice.
+
+NOTE: The data for this project come from this source: http://groupware.les.inf.puc-rio.br/har.
+
+## 1 Preliminary Analysis
+
+### 1.1 Load Packages and Data
+
+Load packages we need
+```{r load packages, results='hide'}
+library(caret)
+library(ggplot2)
+library(RANN)
+```
+
+Load data
+```{r load data, cache=TRUE}
+wd <- getwd()
+## check file folds
+if(!file.exists("./data")){
+dir.create("./data")
+  }
+## check files
+if(!file.exists("./data/pml-testing.csv")){
+test_url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+download.file(test_url, destfile = "./data/pml-testing.csv", method = "curl")
+  }
+if(!file.exists("./data/pml-training.csv")){
+train_url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+download.file(train_url, destfile = "./data/pml-training.csv", method = "curl")
+  }
+## load files
+if(file.exists("./data/pml-testing.csv")){
+ testing <- read.csv("./data/pml-testing.csv")
+  }
+if(file.exists("./data/pml-training.csv")){
+ training <- read.csv("./data/pml-training.csv")
+  }
+```
+
+### 1.2 Preprocess Data
+
+#### First Glance
+Firstly, let's take a glance at the data.
+```{r EDA, results='hold'}
+dim(training)
+dim(testing)
+##the number of columes with NAs
+length(names(testing[, colSums(is.na(testing)) == 0]))
+length(names(training[, colSums(is.na(training)) == 0]))
+```
+
+#### Remove NAs
+We could see a lot of columes are filled with NAs which is unpleasant for following prediction model building. Plus, training set and testing set have different number of columes with NAs. So, we could remove columes with NAs directly. (Note, knnImpute is not appliable for this testing set)
+
+```{r NAs, cache=TRUE}
+selectColum <- names(testing[, colSums(is.na(testing)) == 0])
+adTesting <- testing[, selectColum]
+selectColum <- selectColum[-60]
+adTraining <- training[, c(selectColum,"classe")]
+```
+
+#### Remove zero variance 
+
+In case the negative effect of variables with zero variance, we remove those variables. 
+```{r zero variance}
+nzv <- nearZeroVar(adTraining, saveMetrics = TRUE)
+adTraining <- adTraining[, which(nzv$nzv == FALSE)]
+adTesting <- adTesting[, which(nzv$nzv == FALSE)]
+```
+
+### 1.3 Data Slicing - cross validation
+
+Besides testing data set, in order to perform cross validation, we could build a validation data set and a test set inside the training set. 
+```{r cv}
+set.seed(1234)
+inVali <- createDataPartition(y = adTraining$classe, p = 0.6, list = FALSE)
+training2 <- adTraining[inVali, ]
+testNvali <- adTraining[-inVali, ]
+inVali2 <- createDataPartition(y = testNvali$classe, p = 0.5, list = FALSE)
+testing2 <- testNvali[inVali2, ]
+validation <- testNvali[-inVali2, ]
+```
+
+## 2 Model Buiding
+
+### 2.1 Preprocessing with PCA
+As we can see from EDA, there are more than 50 variables in each data set, but perhaps we don't need every variable. Principle component analysis(PCA) therefore would be a nice choice to preprocess the data set so to create the most useful variables.
+
+```{r pca}
+preProc <- preProcess(training2[,-c(2,5,59)], method = "pca", pcaComp = 3)
+trainPC <- predict(preProc, training2[,-c(2,5,59)])
+```
+
+### 2.2 Model Building
+Given that our goal is to accurately classify type of actions, here we could use several classification tactics, namely random forest, bagging and boosting.
+
+#### Random Forest
+```{r model, cache=TRUE}
+##set a timer
+ptm <- proc.time()
+##fit model
+modFit <- train(y = training2$classe, method = "rf", x = trainPC)
+##tell code time
+rftime <- proc.time() - ptm
+##test on the validation set
+valiPC <- predict(preProc, validation[,-c(2,5,126)])
+rfac <- confusionMatrix(validation$classe, predict(modFit, valiPC))$overall[[1]]
+```
+
+#### Bagging-with PCA
+```{r bag1, cache=TRUE}
+##set a timer
+ptm <- proc.time()
+##fit model with preprocessed data
+modBag <- train(y = training2$classe, method = "treebag", x = trainPC)
+##tell code time
+bagtime <- proc.time() - ptm
+##test on the validation set
+bagac <- confusionMatrix(validation$classe, predict(modBag, valiPC))$overall[[1]]
+```
+
+#### Boosting
+```{r model3, cache=TRUE}
+##set a timer
+ptm <- proc.time()
+##fit model
+modBst <- train(y = training2$classe, method = "gbm", x = trainPC, verbose = FALSE)
+##tell code time
+bsttime <- proc.time() - ptm
+##test on the validation set
+bstac <- confusionMatrix(validation$classe, predict(modBag, valiPC))$overall[[1]]
+```
+
+#### Combine Predictors 
+Combining predictors could efficiently further improve accuracy of algorithms, although that might be computationally intensive. Here, we will practice model ensembling.
+```{r combine}
+ptm <- proc.time()
+rf.vali <- predict(modFit, valiPC)
+bag.vali <- predict(modBag, valiPC)
+bst.vali <- predict(modBst, valiPC)
+combineValiData <- data.frame(rf.pred = rf.vali, bag.pred = bag.vali, bst.pred = bst.vali, classe = validation$classe)
+modComb <- train(classe~., method = "gam", data = combineValiData)
+combtime <- proc.time() - ptm + rftime + bagtime + bsttime
+combac <- confusionMatrix(validation$classe, predict(modComb, combineValiData))$overall[[1]]
+```
+
+#### Bagging-without PCA
+Also, in case that PCA might sacrifice accuracy, we could try to build a model with original data.
+```{r bag2}
+##fit a model with original data
+##set a timer
+ptm <- proc.time()
+bag.fit <- train(classe ~ ., method = "treebag", data = training2, trControl = trainControl(method = "cv"), number =3)
+##tell code time
+bagtime2 <- proc.time() - ptm
+bagac2 <- confusionMatrix(validation$classe, predict(bag.fit, validation))$overall[[1]]
+```
+
+### 2.4 Model Testing
+
+In order to measure the out of sample error, we apply our models into our test set.
+```{r error1}
+##test in testing set
+testPC <- predict(preProc, testing2[,-c(2,5,126)])
+rf.test <- confusionMatrix(testing2$classe, predict(modFit, testPC))$overall[[1]]
+bag.test <- confusionMatrix(testing2$classe, predict(modBag, testPC))$overall[[1]]
+bst.test <- confusionMatrix(testing2$classe, predict(modBst, testPC))$overall[[1]]
+bag.test.noPCA <- confusionMatrix(testing2$classe, predict(bag.fit, testing2))$overall[[1]]
+##combine predictors
+rf.t <- predict(modFit, testPC)
+bag.t <- predict(modBag, testPC)
+bst.t <- predict(modBst, testPC)
+combineTestData <- data.frame(rf.pred = rf.t, bag.pred = bag.t, bst.pred = bst.t, classe = testing2$classe)
+comb.test <- confusionMatrix(testing2$classe, predict(modComb, combineTestData))$overall[[1]]
+```
+
+### 2.5 Model Choosing
+Now, let's compare all these algorithms and choose the final one.
+```{r compare}
+data.frame(vali.accuracy = c(rfac, bagac, bstac, combac, bagac2), test.accuracy = c(rf.test, bag.test, bst.test, comb.test, bag.test.noPCA), time = c(rftime[3],bagtime[3],bsttime[3],combtime[3],bagtime2[3]), row.names = c("rf","bagging","boosting","combine","bagging.noPCA"))
+```
+Obviously, **bagging without PCA is the best choice.** Interestingly, although we apply PCA and model ensembling all together so to improve accuracy, the results shows the simplest way is the best way. Perhaps, Occam's Razor is also applicable in data analysis. Also, it's important to note that boosting is not a very stable algorithm, with a high out of the sample error rate. 
+
+## 3 Conclusion
+
+From our analysis, we could draw conclusions: 
+
+- Bagging is the best algorithm to tell the manners with high accuracy and acceptable computational tensity. The out of sample error rate is 0.08%, less than 0.1%.
+
+- Preprocessing with PCA and model ensembling could't always provide us the best algorithm. Sometimes, the simpest could be the best.
+
